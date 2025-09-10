@@ -12,7 +12,7 @@ torch.inference_mode()
 torch.set_default_device("cpu")
 
 # Read MODEL_ID from environment variable, fallback to default
-MODEL_ID = os.environ.get("MODEL_ID", "microsoft/phi-4")
+MODEL_ID = os.environ.get("MODEL_ID", "stabilityai/stablelm-2-zephyr-1_6b")
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
