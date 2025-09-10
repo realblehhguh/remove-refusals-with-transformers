@@ -1,75 +1,81 @@
-import jaxtyping
-
-import random
-
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer, BitsAndBytesConfig
+from typing import Optional, Tuple
+import os
 
 import einops
-
-from tqdm import tqdm
+import jaxtyping
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer, BitsAndBytesConfig
 
 torch.inference_mode()
 
-MODEL_ID = "microsoft/phi-4"
-#MODEL_ID = "Qwen/Qwen1.5-1.8B-Chat"
-#MODEL_ID = "Qwen/Qwen-1_8B-chat"
-#MODEL_ID = "google/gemma-1.1-2b-it"
-#MODEL_ID = "google/gemma-1.1-7b-it"
-#MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
+torch.set_default_device("cpu")
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, trust_remote_code=True, torch_dtype=torch.float16, quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16))
+# Read MODEL_ID from environment variable, fallback to default
+MODEL_ID = os.environ.get("MODEL_ID", "stabilityai/stablelm-2-zephyr-1_6b")
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    trust_remote_code=True,
+    device_map="cuda",
+    quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-# settings:
-instructions = 32
-layer_idx = int(len(model.model.layers) * 0.6)
-pos = -1
+refusal_dir = torch.load(MODEL_ID.replace("/", "_") + "_refusal_dir.pt")
 
-print("Instruction count: " + str(instructions))
-print("Layer index: " + str(layer_idx))
 
-with open("harmful.txt", "r") as f:
-    harmful = f.readlines()
+def direction_ablation_hook(
+    activation: jaxtyping.Float[torch.Tensor, "... d_act"],
+    direction: jaxtyping.Float[torch.Tensor, "d_act"]
+):
+    proj = einops.einsum(activation, direction.view(-1, 1), '... d_act, d_act single -> ... single') * direction
+    return activation - proj
 
-with open("harmless.txt", "r") as f:
-    harmless = f.readlines()
 
-harmful_instructions = random.sample(harmful, instructions)
-harmless_instructions = random.sample(harmless, instructions)
+class AblationDecoderLayer(nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        assert not output_attentions
 
-harmful_toks = [
-    tokenizer.apply_chat_template(conversation=[{"role": "user", "content": insn}], add_generation_prompt=True,
-                                  return_tensors="pt") for insn in harmful_instructions]
-harmless_toks = [
-    tokenizer.apply_chat_template(conversation=[{"role": "user", "content": insn}], add_generation_prompt=True,
-                                  return_tensors="pt") for insn in harmless_instructions]
+        ablated = direction_ablation_hook(hidden_states, refusal_dir.to(hidden_states.device)).to(hidden_states.device)
 
-max_its = instructions*2
-bar = tqdm(total=max_its)
+        outputs = (ablated,)
 
-def generate(toks):
-    bar.update(n=1)
-    return model.generate(toks.to(model.device), use_cache=False, max_new_tokens=1, return_dict_in_generate=True, output_hidden_states=True)
+        if use_cache:
+            outputs += (past_key_value,)
 
-harmful_outputs = [generate(toks) for toks in harmful_toks]
-harmless_outputs = [generate(toks) for toks in harmless_toks]
+        # noinspection PyTypeChecker
+        return outputs
 
-bar.close()
 
-harmful_hidden = [output.hidden_states[0][layer_idx][:, pos, :] for output in harmful_outputs]
-harmless_hidden = [output.hidden_states[0][layer_idx][:, pos, :] for output in harmless_outputs]
+for idx in reversed(range(len(model.model.layers))):  # for qwen 1 this needs to be changed to model.transformer.h
+    model.model.layers.insert(idx, AblationDecoderLayer())
 
-print(harmful_hidden)
+conversation = []
 
-harmful_mean = torch.stack(harmful_hidden).mean(dim=0)
-harmless_mean = torch.stack(harmless_hidden).mean(dim=0)
+streamer = TextStreamer(tokenizer)
 
-print(harmful_mean)
+print(f"Chat with {MODEL_ID}:")
+while True:
+    prompt = input()
+    conversation.append({"role": "user", "content": prompt})
+    toks = tokenizer.apply_chat_template(
+        conversation=conversation,
+        add_generation_prompt=True,
+        return_tensors="pt"
+    )
 
-refusal_dir = harmful_mean - harmless_mean
-refusal_dir = refusal_dir / refusal_dir.norm()
+    gen = model.generate(toks.to(model.device), streamer=streamer, max_new_tokens=1337)
 
-print(refusal_dir)
-
-torch.save(refusal_dir, MODEL_ID.replace("/", "_") + "_refusal_dir.pt")
+    decoded = tokenizer.batch_decode(gen[0][len(toks[0]):], skip_special_tokens=True)
+    conversation.append({"role": "assistant", "content": "".join(decoded)})
